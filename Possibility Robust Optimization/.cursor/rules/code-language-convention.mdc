@@ -1,0 +1,29 @@
+---
+description: Conversation in Chinese, code and comments in English
+alwaysApply: true
+---
+
+# Language Convention
+
+## Interaction Language
+- All conversation with the user must be in **Chinese (Simplified)**.
+
+## Code Language
+- All code (variables, functions, classes, file names) must be written in **English**.
+- All code comments and docstrings must be written in **English**.
+
+## Examples
+
+### ✅ GOOD - English code and comments
+```python
+def calculate_alpha_cut(possibility: float, alpha: float) -> float:
+    """Calculate the alpha-cut of a possibility distribution."""
+    return max(0.0, min(1.0, possibility - alpha))
+```
+
+### ❌ BAD - Chinese comments in code
+```python
+def calculate_alpha_cut(possibility: float, alpha: float) -> float:
+    """计算可能性分布的 α 截集"""
+    return max(0.0, min(1.0, possibility - alpha))
+```
