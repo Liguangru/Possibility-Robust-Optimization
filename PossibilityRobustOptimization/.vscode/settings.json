@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "terminal.integrated.tabs.title": "${workspaceFolderName}",
+    "terminal.integrated.tabs.description": "",
+    "terminal.integrated.tabs.hideCondition": "never",
+    "terminal.integrated.shellIntegration.enabled": true,
+}
