@@ -1,5 +1,9 @@
 ﻿# Local reference PDFs (not tracked)
 Possibility Robust Optimization/Reference/*.pdf
+
+# Keep dose matrices local because they are too large for regular Git pushes.
+PossibilityRobustOptimization/DoseMatrix/
+
 .venv/
 __pycache__/
 *.py[cod]
