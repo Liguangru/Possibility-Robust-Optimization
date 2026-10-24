@@ -1,5 +1,5 @@
-﻿# Local reference PDFs (not tracked)
-Possibility Robust Optimization/Reference/*.pdf
+﻿# Keep reference documents local.
+PossibilityRobustOptimization/Reference/
 
 # Keep dose matrices local because they are too large for regular Git pushes.
 PossibilityRobustOptimization/DoseMatrix/
