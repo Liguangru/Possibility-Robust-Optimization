@@ -166,6 +166,18 @@ def find_rtdose_files(paths):
     return rtdose_files
 
 
+def as_value_list(value):
+    """Return a DICOM element value as a list; single-valued elements stay iterable."""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value] if value else []
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
 def check_geometry(ref, ds, name):
     """Exit if a dose grid differs from the reference grid."""
     def get(d, tag, default=None):
@@ -175,9 +187,12 @@ def check_geometry(ref, ds, name):
         plans = get(d, "ReferencedRTPlanSequence", [])
         return get(plans[0], "ReferencedSOPInstanceUID") if plans else None
 
-    for tag in ("GridFrameOffsetVector", "ReferencedRTPlanSequence"):
-        if tag not in ref or tag not in ds:
-            sys.exit(f"Dose grid mismatch ({tag}): required metadata missing.")
+    if ("ReferencedRTPlanSequence" not in ref
+            or "ReferencedRTPlanSequence" not in ds):
+        sys.exit("Dose grid mismatch (ReferencedRTPlanSequence): required "
+                 "metadata missing.")
+    # GridFrameOffsetVector is optional for single-frame doses; the comparison
+    # below still catches a dataset that omits it while the other one has it.
 
     checks = [
         ("Rows / Columns", (get(ref, "Rows"), get(ref, "Columns")),
@@ -190,8 +205,8 @@ def check_geometry(ref, ds, name):
                          list(get(ds, "PixelSpacing", []))),
         ("ImageOrientationPatient", [round(float(v), 8) for v in get(ref, "ImageOrientationPatient", [])],
                                     [round(float(v), 8) for v in get(ds, "ImageOrientationPatient", [])]),
-        ("GridFrameOffsetVector", [round(float(v), 4) for v in get(ref, "GridFrameOffsetVector", [])],
-                                  [round(float(v), 4) for v in get(ds, "GridFrameOffsetVector", [])]),
+        ("GridFrameOffsetVector", [round(float(v), 4) for v in as_value_list(get(ref, "GridFrameOffsetVector"))],
+                                  [round(float(v), 4) for v in as_value_list(get(ds, "GridFrameOffsetVector"))]),
         ("PatientID", get(ref, "PatientID"), get(ds, "PatientID")),
         ("PatientName", str(get(ref, "PatientName", "")),
                      str(get(ds, "PatientName", ""))),
@@ -239,8 +254,7 @@ def sum_fractions(files):
         ds = pydicom.dcmread(file_path)
         for tag in ("DoseUnits", "DoseGridScaling", "ImagePositionPatient",
                     "ImageOrientationPatient", "PixelSpacing", "Rows",
-                    "Columns", "NumberOfFrames", "FrameOfReferenceUID",
-                    "GridFrameOffsetVector", "ReferencedRTPlanSequence",
+                    "Columns", "FrameOfReferenceUID",
                     "PatientID", "StudyInstanceUID", "SOPClassUID"):
             if tag not in ds:
                 sys.exit(f"{file_path.name}: Missing required RT Dose tag {tag}.")
@@ -270,10 +284,20 @@ def sum_fractions(files):
         seen_uids.add(sop_uid)
         if int(getattr(ds, "PixelRepresentation", 0)) != 0:
             sys.exit(f"{file_path.name}: Signed dose pixels are not supported.")
-        dose = ds.pixel_array.astype(np.float64) * scaling
-        expected_shape = (int(ds.NumberOfFrames), int(ds.Rows), int(ds.Columns))
-        if dose.shape != expected_shape:
-            sys.exit(f"{file_path.name}: Expected dose shape {expected_shape}, got {dose.shape}.")
+        dose = ds.pixel_array.astype(np.float64)
+        if dose.ndim == 2:
+            # A single-frame RT Dose may omit NumberOfFrames and decode as 2D.
+            dose = dose[np.newaxis, ...]
+        dose *= scaling
+        planar_shape = (int(ds.Rows), int(ds.Columns))
+        if dose.ndim != 3 or dose.shape[1:] != planar_shape:
+            sys.exit(f"{file_path.name}: Expected {planar_shape} per dose plane, "
+                     f"got {dose.shape}.")
+        # Fall back to the decoded plane count when NumberOfFrames is absent.
+        declared_frames = int(getattr(ds, "NumberOfFrames", dose.shape[0]))
+        if dose.shape[0] != declared_frames:
+            sys.exit(f"{file_path.name}: Decoded {dose.shape[0]} dose planes but "
+                     f"NumberOfFrames is {declared_frames}.")
         if not np.all(np.isfinite(dose)) or np.any(dose < 0):
             sys.exit(f"{file_path.name}: Dose values must be finite and non-negative.")
         if total is None:
@@ -297,6 +321,7 @@ def build_summed_dataset(total, ref):
         raise ValueError("The cumulative dose exceeds the RT Dose storage range.")
     summed.DoseGridScaling = new_scaling
     summed.PixelData = encoded.astype(np.uint32).tobytes()
+    summed.NumberOfFrames = int(total.shape[0])
     summed.BitsAllocated = 32
     summed.BitsStored = 32
     summed.HighBit = 31
@@ -369,11 +394,11 @@ def _planar_coverage(polygons, grid_shape, row_spacing, column_spacing,
                      supersampling):
     """Rasterize same-plane contours and return relative coverage and distance."""
     margin = 2
-    bounds = np.vstack(polygons)
-    lower = np.floor(bounds.min(axis=0)).astype(int) - margin
-    upper = np.ceil(bounds.max(axis=0)).astype(int) + margin
+    points = np.vstack(polygons)
+    lower = np.floor(points.min(axis=0)).astype(int) - margin
+    upper = np.ceil(points.max(axis=0)).astype(int) + margin
     if np.any(upper <= lower):
-        return np.zeros(grid_shape), None, lower, upper
+        return np.zeros(grid_shape, dtype=np.float32), None, lower, upper
     local_shape = upper - lower
     sampling = (row_spacing / supersampling, column_spacing / supersampling)
     binary_mask = np.zeros(local_shape * supersampling, dtype=bool)
@@ -396,21 +421,21 @@ def _planar_coverage(polygons, grid_shape, row_spacing, column_spacing,
             inside ^= crosses & (columns < intersection)
         binary_mask ^= inside
     if not np.any(binary_mask):
-        return np.zeros(grid_shape), None, lower, upper
+        return np.zeros(grid_shape, dtype=np.float32), None, lower, upper
     coverage = binary_mask.reshape(
         local_shape[0], supersampling, local_shape[1], supersampling,
-    ).mean(axis=(1, 3))
+    ).mean(axis=(1, 3)).astype(np.float32)
     distance_pad = 0
     if np.all(binary_mask):
         # Use exterior padding only for the signed-distance field.
         binary_mask = np.pad(binary_mask, 1)
         distance_pad = 1
     # The distance sign is used for shape-based interpolation between contours.
-    signed_distance = (
-        distance_transform_edt(binary_mask, sampling=sampling)
-        - distance_transform_edt(~binary_mask, sampling=sampling)
-    )
-    result = np.zeros(grid_shape)
+    # float32 halves the per-plane footprint; subpixel distances need no more.
+    signed_distance = distance_transform_edt(binary_mask, sampling=sampling)
+    signed_distance -= distance_transform_edt(~binary_mask, sampling=sampling)
+    signed_distance = signed_distance.astype(np.float32)
+    result = np.zeros(grid_shape, dtype=np.float32)
     output_lower = np.maximum(0, lower)
     output_upper = np.minimum(grid_shape, upper)
     if np.any(output_upper > output_lower):
@@ -424,21 +449,25 @@ def _planar_coverage(polygons, grid_shape, row_spacing, column_spacing,
     return result, signed_distance, lower - distance_pad, upper + distance_pad
 
 
-def _distance_samples(field, bounds, grid_shape, row_spacing, column_spacing,
-                      supersampling):
-    """Evaluate signed distance at all dose-grid subpixel centers."""
-    del row_spacing, column_spacing
-    high_resolution_shape = np.asarray(grid_shape) * supersampling
+def _distance_samples(field, bounds, region, supersampling):
+    """Evaluate a signed-distance field at dose-grid subpixel centers."""
+    region_lower, region_upper = region
+    region_shape = (np.asarray(region_upper, dtype=int)
+                    - np.asarray(region_lower, dtype=int))
+    high_resolution_shape = region_shape * supersampling
     if field is None:
-        return np.full(high_resolution_shape, -1.0)
-    coordinates = np.mgrid[:high_resolution_shape[0], :high_resolution_shape[1]]
-    samples = map_coordinates(
+        # Every sample lies outside the contour, so the interpolated mask is empty.
+        return np.full(high_resolution_shape, -1.0, dtype=np.float32)
+    origin = np.asarray(bounds[0] * supersampling, dtype=np.int64)
+    rows, columns = np.mgrid[
+        region_lower[0] * supersampling:region_upper[0] * supersampling,
+        region_lower[1] * supersampling:region_upper[1] * supersampling,
+    ]
+    return map_coordinates(
         np.asarray(field, dtype=np.float32),
-        [coordinates[0] - bounds[0, 0] * supersampling,
-         coordinates[1] - bounds[0, 1] * supersampling],
+        [rows - origin[0], columns - origin[1]],
         order=1, mode="constant", cval=-1.0, prefilter=False,
     )
-    return samples
 
 
 def rasterize_roi(rtss_ds, summed_ds, roi):
@@ -474,8 +503,11 @@ def rasterize_roi(rtss_ds, summed_ds, roi):
             row_spacing, column_spacing) <= 0:
         sys.exit("PixelSpacing must be positive.")
     grid_shape = (int(summed_ds.Rows), int(summed_ds.Columns))
-    offsets = np.asarray(summed_ds.GridFrameOffsetVector, dtype=float)
-    frame_count = int(summed_ds.NumberOfFrames)
+    frame_count = int(getattr(summed_ds, "NumberOfFrames", 1))
+    # A single-frame RT Dose may omit GridFrameOffsetVector; treat it as one plane.
+    offsets = np.atleast_1d(np.asarray(
+        getattr(summed_ds, "GridFrameOffsetVector", np.zeros(frame_count)),
+        dtype=float))
     if (offsets.size != frame_count or not np.all(np.isfinite(offsets))
             or (frame_count > 1 and not np.allclose(
                 np.diff(offsets), np.diff(offsets)[0], atol=1e-5))):
@@ -523,39 +555,55 @@ def rasterize_roi(rtss_ds, summed_ds, roi):
     if not planes:
         sys.exit("The selected ROI has no contours inside the dose grid.")
     mask = np.zeros((grid_shape[0], grid_shape[1], frame_count), dtype=np.float32)
-    planar_data = {}
-    for frame, (lower_position, upper_position, position) in planes.items():
-        if lower_position not in planar_data:
-            planar_data[lower_position] = _planar_coverage(
-                contour_groups[lower_position], grid_shape,
-                row_spacing, column_spacing, supersampling)
-        if upper_position not in planar_data:
-            planar_data[upper_position] = _planar_coverage(
-                contour_groups[upper_position], grid_shape,
-                row_spacing, column_spacing, supersampling)
-        lower_data = planar_data[lower_position]
+    # Planes are visited in dose-grid order and a contour plane is dropped once
+    # no later frame brackets it, so at most two planar distance fields are held
+    # at a time. Caching every plane needs gigabytes for body-sized contours.
+    frame_jobs = sorted(planes.items(), key=lambda entry: entry[1][2])
+    pending = {}
+    for _, (lower_position, upper_position, _) in frame_jobs:
+        for key in (lower_position, upper_position):
+            pending[key] = pending.get(key, 0) + 1
+    planar_cache = {}
+    for frame, (lower_position, upper_position, position) in frame_jobs:
+        for key in (lower_position, upper_position):
+            if key not in planar_cache:
+                planar_cache[key] = _planar_coverage(
+                    contour_groups[key], grid_shape,
+                    row_spacing, column_spacing, supersampling)
+        lower_data = planar_cache[lower_position]
         if lower_position == upper_position:
             mask[:, :, frame] = lower_data[0]
-            continue
-        weight = (position - lower_position) / (upper_position - lower_position)
-        upper_data = planar_data[upper_position]
-        lower_bounds = np.array([lower_data[2], lower_data[3]])
-        upper_bounds = np.array([upper_data[2], upper_data[3]])
-        bounds = np.column_stack((
-            np.minimum(lower_bounds[:, 0], upper_bounds[:, 0]),
-            np.maximum(lower_bounds[:, 1], upper_bounds[:, 1]),
-        ))
-        lower_distance = _distance_samples(
-            lower_data[1], lower_bounds, grid_shape,
-            row_spacing, column_spacing, supersampling)
-        upper_distance = _distance_samples(
-            upper_data[1], upper_bounds, grid_shape,
-            row_spacing, column_spacing, supersampling)
-        interpolated = ((1.0 - weight) * lower_distance + weight * upper_distance)
-        # Sample both distance fields on the same high-resolution dose grid.
-        mask[:, :, frame] = (interpolated >= 0.0).reshape(
-            grid_shape[0], supersampling, grid_shape[1], supersampling,
-        ).mean(axis=(1, 3))
+        else:
+            weight = (position - lower_position) / (upper_position - lower_position)
+            upper_data = planar_cache[upper_position]
+            lower_bounds = np.array([lower_data[2], lower_data[3]])
+            upper_bounds = np.array([upper_data[2], upper_data[3]])
+            # Both fields are sampled on the same dose-grid region. Outside it the
+            # interpolation falls back to cval, so it can never add coverage.
+            region_lower = np.maximum(
+                np.minimum(lower_bounds[0], upper_bounds[0]), 0)
+            region_upper = np.minimum(
+                np.maximum(lower_bounds[1], upper_bounds[1]), grid_shape)
+            if np.all(region_upper > region_lower):
+                region = (region_lower, region_upper)
+                lower_distance = _distance_samples(
+                    lower_data[1], lower_bounds, region, supersampling)
+                upper_distance = _distance_samples(
+                    upper_data[1], upper_bounds, region, supersampling)
+                interpolated = ((1.0 - weight) * lower_distance
+                                + weight * upper_distance)
+                region_shape = region_upper - region_lower
+                mask[region_lower[0]:region_upper[0],
+                     region_lower[1]:region_upper[1], frame] = (
+                    (interpolated >= 0.0).reshape(
+                        region_shape[0], supersampling,
+                        region_shape[1], supersampling,
+                    ).mean(axis=(1, 3))
+                )
+        for key in (lower_position, upper_position):
+            pending[key] -= 1
+            if pending[key] <= 0:
+                del planar_cache[key]
     if not np.any(mask):
         sys.exit("The selected ROI has no voxels inside the dose grid.")
     voxel_volume_cc = row_spacing * column_spacing * slice_thickness / 1000.0
